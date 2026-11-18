@@ -1,13 +1,28 @@
 services:
-  web:
+  guard-a:
     build: .
-    container_name: cdc-release-guard
+    container_name: cdc-release-guard-a
     ports:
-      - "8000:8000"
+      - "8000:8000"          # 实例 A 审查台 → http://localhost:8000/
     environment:
       - DB_PATH=/data/app.db
+      - INSTANCE_LABEL=实例 A
+      - PEER_URL=http://localhost:8001/
     volumes:
-      - app_data:/data   # SQLite 持久化：公开记录重启保留
+      - app_data:/data       # 与 guard-b 共用同一 SQLite 库文件
+    restart: unless-stopped
+
+  guard-b:
+    build: .
+    container_name: cdc-release-guard-b
+    ports:
+      - "8001:8000"          # 实例 B 审查台 → http://localhost:8001/
+    environment:
+      - DB_PATH=/data/app.db
+      - INSTANCE_LABEL=实例 B
+      - PEER_URL=http://localhost:8000/
+    volumes:
+      - app_data:/data       # 同一命名卷 → 跨进程共享调查库与公开记录
     restart: unless-stopped
 
 volumes:

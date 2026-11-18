@@ -15,20 +15,24 @@
 import asyncio
 import csv
 import io
-import sqlite3
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .database import (
+    AlreadyImported,
+    DatabaseBusy,
     get_cells,
+    get_public_snapshot,
     get_publications,
     init_db,
-    insert_cells,
-    insert_publication,
+    insert_cells_once,
+    publish_guarded,
 )
 from .solver import evaluate
 
@@ -39,6 +43,11 @@ SAMPLE_CSV = BASE_DIR / "sample_survey.csv"
 MAX_CELLS = 16
 MIN_POPULATION = 5
 
+# 仅用于演示/日志区分两台实例；不影响审查逻辑。
+INSTANCE_LABEL = os.environ.get("INSTANCE_LABEL", "default")
+# 另一台实例的浏览器可达地址（用于页面上演示并行确认）。
+PEER_URL = os.environ.get("PEER_URL", "")
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -48,9 +57,17 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="疾控汇总发布安全审查台", lifespan=lifespan)
 
-# 发布串行化：确认发布时在此锁内重读最新公开记录并重核，
-# 保证"各自安全但合并不安全"的两个窗口不会都被写入。
-publish_lock = asyncio.Lock()
+# 演示用：允许两台实例的网页互相发起请求（仅本机演示场景，生产应限制来源）。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# 说明：发布互斥不再依赖进程内锁。确认发布在 SQLite 的
+# BEGIN IMMEDIATE 写事务内重读最新公开记录并重核，多台服务实例
+# 各自独立连接同一库文件时也天然串行，见 database.publish_guarded()。
 
 
 # ---------------- CSV 导入 ----------------
@@ -178,10 +195,12 @@ async def import_csv(file: UploadFile = File(...)):
     except ValueError as e:
         raise HTTPException(400, str(e))
     try:
-        insert_cells(rows)
-    except sqlite3.IntegrityError:
-        # 并发导入或组合冲突：整体回滚，先到先得。
+        insert_cells_once(rows)
+    except AlreadyImported:
+        # 另一进程已先导入：本次整体回滚，先到先得。
         raise HTTPException(409, "调查数据已导入，不可更换")
+    except DatabaseBusy:
+        raise HTTPException(503, "数据库繁忙，导入未写入，请重试")
     return {
         "imported": len(rows),
         "districts": sorted({r["district"] for r in rows}),
@@ -193,6 +212,8 @@ async def import_csv(file: UploadFile = File(...)):
 def admin_state():
     cells = get_cells()
     return {
+        "instance": INSTANCE_LABEL,
+        "peer_url": PEER_URL,
         "imported": bool(cells),
         "districts": sorted({c["district"] for c in cells}),
         "age_groups": sorted({c["age_group"] for c in cells}),
@@ -228,30 +249,46 @@ async def publish(sel: Selection):
         "age_groups": sel.age_groups,
         "total": total,
     }
-    async with publish_lock:
-        # 确认发布：按最新公开记录重核（防止两个窗口各自安全、合并不安全却都发布）。
-        pubs = get_publications()
-        result = await asyncio.to_thread(evaluate, cells, pubs, candidate)
-        if not result["safe"]:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "按最新公开记录重核未通过：可能暴露小样本格值，已拒绝发布",
-                    "affected": result["affected"],
-                },
-            )
-        try:
-            pub = insert_publication(sel.districts, sel.age_groups, total)
-        except Exception:
-            # 单事务写入，失败即回滚，不会留下半次发布。
-            raise HTTPException(500, "保存失败，未产生任何发布记录")
-    return pub
+
+    def _evaluate_latest(publications: list[dict]) -> dict:
+        return evaluate(cells, publications, candidate)
+
+    # 跨进程原子发布：在 SQLite 写事务（BEGIN IMMEDIATE）内
+    # 重读最新公开记录 → 重核 → 写入，任一失败整体回滚。
+    # 两台服务实例各自安全、合并不安全时，后取得写锁者会看到先提交记录
+    # 并因此被拒绝，因而只可能有一份被发布。
+    try:
+        result = await asyncio.to_thread(
+            publish_guarded, sel.districts, sel.age_groups, total, _evaluate_latest
+        )
+    except DatabaseBusy:
+        # 另一进程长时间持有写事务：本次未写入，可安全重试。
+        raise HTTPException(503, "发布队列繁忙，未产生任何发布记录，请重试")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(500, "保存失败，未产生任何发布记录")
+
+    if result["status"] != "published":
+        evaluation = result["evaluation"]
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "按最新公开记录重核未通过：可能暴露小样本格值，已拒绝发布",
+                "affected": evaluation["affected"],
+            },
+        )
+    return result["publication"]
 
 
 @app.get("/api/public")
 def public_data():
-    """公开数据：仅人数与获准汇总，绝不包含格内检出数。"""
-    cells = get_cells()
+    """公开数据：仅人数与获准汇总，绝不包含格内检出数。
+
+    在单个只读事务中读取，且 WAL 允许读与写并发：
+    其他进程正在确认发布时，本页仍可正常读取。
+    """
+    cells, pubs = get_public_snapshot()
     return {
         "imported": bool(cells),
         "cells": [
@@ -262,5 +299,5 @@ def public_data():
             }
             for c in cells
         ],
-        "publications": get_publications(),
+        "publications": pubs,
     }

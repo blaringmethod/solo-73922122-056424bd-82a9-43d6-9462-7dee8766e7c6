@@ -145,15 +145,14 @@ def run():
 
         # ---- 9. 保存失败不留半次发布 ----
         import app.database as dbmod
-        import app.main as mainmod
 
         before = len(client.get("/api/public").json()["publications"])
 
-        # 9a. 接口层：插入时发生异常 → 500 且无记录产生
-        orig_insert = mainmod.insert_publication
+        # 9a. 存储层：写入过程中抛异常（模拟提交阶段失败）→ 500 且无记录产生
+        orig_insert = dbmod._insert_publication
         def _boom(*a, **k):
             raise RuntimeError("模拟保存失败")
-        mainmod.insert_publication = _boom
+        dbmod._insert_publication = _boom
         try:
             r = client.post(
                 "/api/publish",
@@ -161,7 +160,7 @@ def run():
             )
             check("保存时异常返回 500", r.status_code == 500, r.text)
         finally:
-            mainmod.insert_publication = orig_insert
+            dbmod._insert_publication = orig_insert
         after = len(client.get("/api/public").json()["publications"])
         check("保存失败未留下半次发布", after == before, f"before={before} after={after}")
 
@@ -177,6 +176,34 @@ def run():
             dbmod.DB_PATH = orig_path
         after = len(client.get("/api/public").json()["publications"])
         check("库写失败后记录数不变", after == before, f"before={before} after={after}")
+
+        # 9c. 存储层：事务内评估通过但写入抛错 → 回滚，无记录残留
+        #     （模拟"重核通过后、提交前"崩溃/失败，验证不会留下半次发布）
+        before = len(dbmod.get_publications())
+        def _eval_safe(_pubs):
+            return {"safe": True, "affected": []}
+        orig_ins = dbmod._insert_publication
+        def _boom_insert(*a, **k):
+            raise RuntimeError("提交前失败")
+        dbmod._insert_publication = _boom_insert
+        try:
+            dbmod.publish_guarded(["城东"], ["青年"], 2, _eval_safe)
+            check("存储层提交前失败应抛错", False, "未抛错")
+        except RuntimeError:
+            check("存储层提交前失败抛错", True)
+        finally:
+            dbmod._insert_publication = orig_ins
+        check("提交前失败后无记录残留", len(dbmod.get_publications()) == before,
+              f"before={before} after={len(dbmod.get_publications())}")
+
+        # 9d. 存储层：不安全时返回 unsafe 且库不变（仅内存判定，不写入）
+        before = len(dbmod.get_publications())
+        out = dbmod.publish_guarded(
+            ["城东", "城西"], ["老年"], 16,
+            lambda _p: {"safe": False, "affected": [{"district": "城东", "age_group": "青年"}]},
+        )
+        check("不安全候选返回 unsafe 且不写入",
+              out["status"] == "unsafe" and len(dbmod.get_publications()) == before, out)
 
         # ---- 10. 求解器并发安全（z3 每评估独立 Context） ----
         from concurrent.futures import ThreadPoolExecutor

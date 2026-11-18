@@ -9,6 +9,7 @@
   header{background:#0f4c81;color:#fff;padding:14px 24px;display:flex;align-items:baseline;gap:16px}
   header h1{margin:0;font-size:20px}
   header a{color:#cfe3ff;font-size:13px}
+  .tag{margin-left:auto;font-size:12px;background:rgba(255,255,255,.16);padding:3px 9px;border-radius:10px}
   main{max-width:1000px;margin:20px auto;padding:0 16px}
   section{background:#fff;border-radius:8px;padding:16px 20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   h2{font-size:16px;margin:0 0 12px}
@@ -29,6 +30,7 @@
 <body>
 <header>
   <h1>疾控汇总发布安全审查台（内部）</h1>
+  <span id="instanceTag" class="tag">实例：…</span>
   <a href="/public" target="_blank">查看公开页 →</a>
 </header>
 <main>
@@ -60,6 +62,22 @@
   <section id="pubSec" class="hidden">
     <h2>4. 已公开记录（不可撤销）</h2>
     <div id="pubs"></div>
+  </section>
+
+  <section id="raceSec" class="hidden">
+    <h2>5. 双实例并行确认演示</h2>
+    <p class="hint">两台服务实例共用同一 SQLite 库。下面同时向 <b>本实例</b> 与
+      <b id="peerName">另一实例</b> 发出确认：窗口 A 由本实例发布，窗口 B 由另一实例发布。
+      两窗口单独看都安全，合并后会钉死小样本格——因此只应有一份被受理，另一份收到 409
+      并列出受影响格与可行范围。若选择两个合并后仍安全的窗口，则两份都应成功。</p>
+    <div class="checks" id="raceA"></div>
+    <div class="checks" id="raceB"></div>
+    <div style="margin-top:10px">
+      <button onclick="doParallelConfirm()">同时向两台实例确认发布</button>
+      <button class="secondary" onclick="fillRaceUnsafe()">填入合并不安全的窗口</button>
+      <button class="secondary" onclick="fillRaceSafe()">填入合并安全的窗口</button>
+    </div>
+    <div id="raceMsg" class="msg"></div>
   </section>
 </main>
 <script>
@@ -95,6 +113,7 @@ function showErr(el, e){
 
 async function load(){
   state = await api('/api/admin/state');
+  document.getElementById('instanceTag').textContent = '实例：' + (state.instance || 'default');
   render();
 }
 function render(){
@@ -102,7 +121,17 @@ function render(){
   document.getElementById('importSec').classList.toggle('hidden', imported);
   for(const id of ['gridSec','selSec','pubSec'])
     document.getElementById(id).classList.toggle('hidden', !imported);
+  const peerOk = !!(state.peer_url);
+  document.getElementById('raceSec').classList.toggle('hidden', !(imported && peerOk));
   if(!imported) return;
+
+  if(peerOk){
+    document.getElementById('peerName').textContent = state.peer_url;
+    const opts = (cls) => state.districts.map(d => `<label><input type="checkbox" class="${cls}d" value="${esc(d)}"> ${esc(d)}</label>`).join('')
+      + '<br>' + state.age_groups.map(a => `<label><input type="checkbox" class="${cls}a" value="${esc(a)}"> ${esc(a)}</label>`).join('');
+    document.getElementById('raceA').innerHTML = '<b>窗口 A（本实例）：</b>' + opts('ra');
+    document.getElementById('raceB').innerHTML = '<b>窗口 B（另一实例）：</b>' + opts('rb');
+  }
 
   let h = '<table><tr><th>分区</th><th>年龄组</th><th>人数</th><th>检出数</th></tr>';
   for(const c of state.cells)
@@ -175,6 +204,80 @@ async function doPublish(){
     el.textContent = `已发布 #${r.id}：检出总数 ${r.total}（${esc(r.created_at)}）`;
     await load();
   }catch(e){ showErr(el, e); }
+}
+
+// ---- 双实例并行确认演示 ----
+function raceSel(prefix){
+  const q = s => [...document.querySelectorAll(`.${prefix}${s}:checked`)].map(e => e.value);
+  return {districts: q('d'), age_groups: q('a')};
+}
+function setChecks(prefix, ds, as){
+  for(const el of document.querySelectorAll(`.${prefix}d`)) el.checked = ds.includes(el.value);
+  for(const el of document.querySelectorAll(`.${prefix}a`)) el.checked = as.includes(el.value);
+}
+function pick(names, want){
+  return want.filter(w => names.includes(w));
+}
+function fillRaceUnsafe(){
+  const ds = state.districts, as = state.age_groups;
+  // A = 城东 × {青年,老年}；B = {城东,城西} × 老年 —— 合并后 城东/青年 被钉在 [0,4]
+  setChecks('ra', pick(ds, ['城东']), pick(as, ['青年', '老年']));
+  setChecks('rb', pick(ds, ['城东', '城西']), pick(as, ['老年']));
+  document.getElementById('raceMsg').className = 'msg';
+}
+function fillRaceSafe(){
+  const ds = state.districts, as = state.age_groups;
+  // A = 城东 × {青年,老年}；B = 城西 × {青年,老年} —— 合并后仍各自安全
+  setChecks('ra', pick(ds, ['城东']), pick(as, ['青年', '老年']));
+  setChecks('rb', pick(ds, ['城西']), pick(as, ['青年', '老年']));
+  document.getElementById('raceMsg').className = 'msg';
+}
+async function postOnce(base, sel){
+  const url = (base || '').replace(/\/+$/, '') + '/api/publish';
+  const r = await fetch(url, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(sel),
+  });
+  const body = await r.json().catch(() => ({}));
+  return {status: r.status, body};
+}
+function describeRace(label, res){
+  if(res.status === 201){
+    return `${label}：✓ 已发布 #${res.body.id}（总数 ${res.body.total}）`;
+  }
+  const d = res.body && res.body.detail;
+  let t = `${label}：✗ 拒绝（HTTP ${res.status}）`;
+  if(d && d.affected && d.affected.length){
+    t += '\n  受影响格：' + d.affected.map(a =>
+      `${a.district}/${a.age_group} 可行范围 [${a.min}, ${a.max}]，`
+      + (a.zero_feasible ? '可取 0' : '不可取 0') + '，'
+      + (a.ge5_feasible ? '可取 ≥5' : '不可取 ≥5')).join('\n  ');
+  }else if(typeof d === 'string'){ t += '\n  ' + d; }
+  else if(d && d.message){ t += '\n  ' + d.message; }
+  return t;
+}
+async function doParallelConfirm(){
+  const el = document.getElementById('raceMsg');
+  const a = raceSel('ra'), b = raceSel('rb');
+  if(!a.districts.length || !a.age_groups.length || !b.districts.length || !b.age_groups.length){
+    el.className = 'msg err'; el.textContent = '请为两个窗口都勾选分区与年龄组'; return;
+  }
+  el.className = 'msg'; el.textContent = '两实例同时确认中…';
+  try{
+    // 关键：同时发出，不等待第一个完成——由数据库写锁决定先后。
+    const [ra, rb] = await Promise.all([postOnce('', a), postOnce(state.peer_url, b)]);
+    const okA = ra.status === 201, okB = rb.status === 201;
+    el.className = 'msg ' + (okA !== okB ? 'ok' : (okA && okB ? 'ok' : 'err'));
+    let head = okA && okB
+      ? '合并安全：两份均已发布。'
+      : (!okA && !okB ? '两份均被拒绝。' : '合并不安全：只发布了一份，另一份被拒绝。');
+    el.textContent = head + '\n\n' + describeRace('本实例（窗口 A）', ra)
+      + '\n\n' + describeRace('另一实例（窗口 B）', rb);
+    await load();
+  }catch(e){
+    el.className = 'msg err';
+    el.textContent = '并行确认失败：' + (e && e.message ? e.message : e)
+      + '\n（请确认两台实例均可访问，且 PEER_URL 已正确配置）';
+  }
 }
 load();
 </script>
